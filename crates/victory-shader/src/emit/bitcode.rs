@@ -7,14 +7,31 @@
 
 use std::collections::HashMap;
 
+pub mod census;
+pub mod opt;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
+
+/// What the lowering made an instruction for, where it says so (counted by
+/// [`census`], nothing else reads it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    /// The select that keeps a register's old value in lanes a guard masks.
+    Guard,
+    /// An index clamp the translation adds (the console has none).
+    Clamp,
+    /// The iteration counter and limit test the translation adds to a loop.
+    Counter,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// A 64-bit float (`double`); made and taken apart through
+    /// `dx.op.makeDouble` / `dx.op.splitDouble`.
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -40,7 +57,6 @@ struct Global {
     /// Its pointer type.
     ptr: Ty,
     space: u32,
-    align: u64,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
 }
@@ -75,6 +91,7 @@ pub(crate) enum Bin {
 pub(crate) enum Rmw {
     Xchg = 0,
     Add = 1,
+    Sub = 2,
     And = 3,
     Or = 5,
     Xor = 6,
@@ -99,7 +116,6 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
-#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -150,8 +166,6 @@ enum Op {
     AtomicRmw(Rmw, V, V),
     /// Pointer, expected, new; returns `{i32, i1}`.
     CmpXchg(V, V, V),
-    /// One of the type, per lane (a local array); the size constant.
-    Alloca(Ty, V),
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +228,8 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// See [`Tag`]: by instruction.
+    tags: HashMap<u32, Tag>,
 }
 
 impl Module {
@@ -225,47 +241,6 @@ impl Module {
         self.types.push(def.clone());
         self.type_ids.insert(def, t);
         Ty(t)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn uses_of(&self, target: V) -> usize {
-        let mut n = 0;
-        let mut count = |v: V| {
-            if v == target {
-                n += 1;
-            }
-        };
-        for inst in &self.insts {
-            match &inst.op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
-                    count(*a);
-                    count(*b);
-                }
-                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
-                Op::AtomicRmw(_, c, t) => {
-                    count(*c);
-                    count(*t);
-                }
-                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
-                    count(*c);
-                    count(*t);
-                    count(*f);
-                }
-                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
-                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
-                Op::Gep(_, base, idx) => {
-                    count(*base);
-                    idx.iter().for_each(|&v| count(v));
-                }
-                Op::Alloca(..) => {}
-            }
-        }
-        for block in &self.blocks {
-            if let Some(Term::CondBr(cond, _, _)) = block.term {
-                count(cond);
-            }
-        }
-        n
     }
 
     pub fn void(&mut self) -> Ty {
@@ -387,15 +362,9 @@ impl Module {
             ty,
             ptr,
             space,
-            align: 3,
             init: None,
         });
         V::Global(self.globals.len() as u32 - 1)
-    }
-
-    pub fn align_global_to_eight(&mut self, global: V) {
-        let V::Global(n) = global else { unreachable!() };
-        self.globals[n as usize].align = 4; // log2(alignment) + 1
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -411,22 +380,19 @@ impl Module {
         g
     }
 
+    /// Notes what instruction `v` is for (see [`Tag`]); only when modules
+    /// are counted.
+    pub fn tag(&mut self, v: V, tag: Tag) {
+        if let V::Inst(i) = v
+            && census::enabled()
+        {
+            self.tags.insert(i, tag);
+        }
+    }
+
     pub fn new_block(&mut self) -> usize {
         self.blocks.push(Block::default());
         self.blocks.len() - 1
-    }
-
-    /// The bits of an integer or float constant (integers as stored,
-    /// sign-extended).
-    pub fn known(&self, v: V) -> Option<i64> {
-        match v {
-            V::Const(i) => match self.consts[i as usize].1 {
-                Const::Int(x) => Some(x),
-                Const::Float(bits) => Some(i64::from(bits)),
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     pub fn type_of(&self, v: V) -> Ty {
@@ -528,12 +494,6 @@ impl Module {
         let pair = self.ty(TypeDef::Struct(None, vec![i32t, i1]));
         let r = self.push(block, pair, Op::CmpXchg(ptr, expected, new));
         self.extract(block, r, 0)
-    }
-
-    /// Memory of type `ty` private to each lane (`alloca`), for the entry block.
-    pub fn alloca(&mut self, block: usize, ty: Ty) -> V {
-        let (ptr, one) = (self.ptr(ty), self.i32(1));
-        self.push(block, ptr, Op::Alloca(ty, one))
     }
 
     pub fn set_phi(&mut self, phi: V, incoming: Vec<(V, usize)>) {
@@ -673,7 +633,7 @@ impl Module {
                     u64::from(g.space) << 2 | 2 | constant,
                     init,
                     linkage,
-                    g.align,
+                    3,
                     0,
                 ],
             );
@@ -920,12 +880,6 @@ impl Module {
                     Op::CmpXchg(p, c, n) => {
                         w.record(46, &[rel(*p), rel(*c), rel(*n), 0, 6, 1, 6, 0]);
                     }
-                    // [type, size type, size (absolute id), alignment 4
-                    // (log2 + 1) | explicit type (bit 6)].
-                    Op::Alloca(ty, n) => {
-                        let (nt, n) = (self.type_of(*n).0, abs(*n));
-                        w.record(19, &[u64::from(ty.0), u64::from(nt), u64::from(n), 3 | 64]);
-                    }
                 }
                 if !self.is_void(inst.ty) {
                     inst_id += 1;
@@ -975,8 +929,6 @@ fn for_each_operand(op: &Op, mut f: impl FnMut(V)) {
             f(*p);
             idx.iter().copied().for_each(f);
         }
-        // The size is a constant.
-        Op::Alloca(..) => {}
     }
 }
 

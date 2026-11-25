@@ -17,13 +17,9 @@
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
-#[cfg(windows)]
-mod card;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-#[cfg(all(windows, feature = "diagnostics"))]
-mod profile;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -31,25 +27,20 @@ mod draw;
 pub mod dxgi;
 pub mod fence;
 pub mod frame;
+pub mod frametime;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
-#[cfg(windows)]
-mod memwait;
-#[cfg(windows)]
-mod memory;
-mod timeline;
-pub mod memstat;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;
-#[cfg(windows)]
-mod rects;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
@@ -57,16 +48,10 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
-#[cfg(windows)]
-mod ambient;
-#[cfg(windows)]
-mod compose;
-#[cfg(windows)]
-mod twin;
-#[cfg(windows)]
-mod texpool;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
@@ -74,9 +59,10 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
-pub use memstat::report as memory_report;
+#[cfg(windows)]
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_committed, title_memory_remapped, title_memory_view, title_memory_view_gone, title_memory_written,
-    writing as kernel_will_write,
+    Remapping, title_memory_reading, title_memory_reading_range, title_memory_remapped, title_memory_remapping,
+    title_memory_remapping_range, writing as kernel_will_write,
 };
