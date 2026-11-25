@@ -615,24 +615,14 @@ impl Lane {
 
 /// Staging bytes a request holds while it runs: what it buffers between
 /// the file and the destination. Raw reads go straight to their
-/// destination, memory sources need none (as on the console). Also counted:
-/// the zlib output a BCPack decode reads, and the whole destination of a
-/// physical-page request, which are buffered here too (each worker holds
-/// all three at once, so leaving them out let loading hold far more than
-/// [`STAGING`]).
+/// destination, memory sources need none (as on the console).
 fn staging_bytes(request: &Request) -> u64 {
-    let mut bytes = 0;
     let buffered = request.options & (ZLIB | BCPACK | PAGE_DESTINATION) != 0;
     if buffered && request.options & MEMORY_SOURCE == 0 {
-        bytes += u64::from(request.source_size);
+        u64::from(request.source_size)
+    } else {
+        0
     }
-    if request.options & ZLIB != 0 && request.options & BCPACK != 0 {
-        bytes += u64::from(request.intermediate_size);
-    }
-    if request.options & PAGE_DESTINATION != 0 {
-        bytes += u64::from(request.destination_size);
-    }
-    bytes
 }
 
 /// Ends a queue: what was not started is dropped, and this waits for the
@@ -984,24 +974,18 @@ fn into_destination(
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
-        victory_gpu::title_memory_written(request.destination as usize, len);
-        return filled;
+        return fill(out).map(drop);
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        let filled = fill(window.bytes()).map(drop);
-        drop(window);
-        super::xmem::physical_written(pages, offset, len);
-        return filled;
+        return fill(window.bytes()).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
     if super::xmem::write_physical(pages, offset, &data[..n]) {
-        super::xmem::physical_written(pages, offset, n);
         Ok(())
     } else {
         // Said aloud: the title never reads a request's result

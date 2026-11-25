@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-game"
 description = "Everything specific to the title: its containers, build identities, patches."

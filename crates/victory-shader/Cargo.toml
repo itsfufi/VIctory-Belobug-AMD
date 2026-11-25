@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-shader"
 description = "Xbox shader containers (DXBC/DXIL + precompiled GFX10) to host shaders."

@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-pe"
 description = "Read-only analysis of PE32+ images and COFF import libraries."

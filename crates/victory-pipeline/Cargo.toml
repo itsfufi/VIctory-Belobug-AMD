@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-pipeline"
 description = "Offline conversion of user-supplied game data into host formats, with a content-addressed cache."

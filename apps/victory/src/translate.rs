@@ -11,7 +11,7 @@ use victory_shader::emit::host::{self, Host};
 use victory_shader::emit::{self, validator::Validator};
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
-    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir,
+    Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir, native_programs,
 };
 use victory_shader::{io, resource};
 
@@ -145,8 +145,6 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 
 /// The optional checks after emission, one set per thread.
 struct Checks {
-    /// The wave sizes to translate for.
-    target: emit::Target,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
@@ -160,9 +158,13 @@ pub fn run(
     pipelines: bool,
     list: bool,
     jobs: Option<usize>,
-    host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    // `VICTORY_HOST_MAX_WAVE=32`: translate as for a host whose waves have
+    // at most 32 lanes (as the runtime does on such a card).
+    if let Some(n) = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok()) {
+        victory_shader::emit::set_host_max_wave(n);
+    }
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -172,21 +174,8 @@ pub fn run(
                 .map_or("dxil.dll".into(), |p| p.display().to_string())
         );
     }
-    let mut target = emit::Target::ANY;
     if pipelines {
-        target = Host::new(false).map_err(anyhow::Error::msg)?.target();
-    }
-    if let Some((lanes_min, lanes_max)) = host_lanes {
-        target = emit::Target {
-            lanes_min,
-            lanes_max,
-        };
-    }
-    if target != emit::Target::ANY {
-        println!(
-            "host waves   {}-{} lanes",
-            target.lanes_min, target.lanes_max
-        );
+        Host::new(false).map_err(anyhow::Error::msg)?;
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -220,7 +209,6 @@ pub fn run(
                             ..Tally::default()
                         };
                         let mut checks = Checks {
-                            target,
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
@@ -318,25 +306,76 @@ pub fn run(
     Ok(())
 }
 
-/// The instructions around `offset` (`VICTORY_AROUND=<count>`, before and
-/// half as many after), with the block each starts in.
-fn disassemble(p: &ir::Program, offset: usize) {
-    let Some(around) = std::env::var("VICTORY_AROUND").ok().and_then(|v| v.parse::<usize>().ok()) else {
-        return;
-    };
-    let all: Vec<(usize, &ir::Inst)> = p
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(b, block)| block.insts.iter().map(move |i| (b, i)))
-        .collect();
-    let at = all
-        .iter()
-        .position(|(_, i)| i.machine.offset == offset)
-        .unwrap_or(0);
-    for (b, i) in &all[at.saturating_sub(around)..(at + around / 2).min(all.len())] {
-        println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
+/// `victory warm`: fills the caches a run reads (`Command::Warm`).
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+    let paths = crate::default_paths(paths)?;
+    let cfg = victory_core::Config::load()?;
+    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let seen = Mutex::new(HashSet::new());
+    let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
+    let started = std::time::Instant::now();
+    for root in &paths {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let jobs = sources(&data);
+            let next = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..threads.min(jobs.len()) {
+                    s.spawn(|| {
+                        while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let Some(bytes) = job.bytes() else { continue };
+                            let Ok(container) = Container::parse(&bytes) else { continue };
+                            // As the title passes it: no more than the container.
+                            let Some(total) = bytes.get(0x18..0x1c).and_then(|b| b.try_into().ok()) else { continue };
+                            let total = u32::from_le_bytes(total) as usize;
+                            let bytes = &bytes[..total.min(bytes.len())];
+                            let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else { continue };
+                            if !lock(&seen).insert(blake3::hash(bytes)) {
+                                continue;
+                            }
+                            let Ok(programs) = native_programs(dxil) else { continue };
+                            let stage = programs.iter().find_map(|p| match p.stage {
+                                HwStage::Vs => Some("vertex"),
+                                HwStage::Ps => Some("pixel"),
+                                HwStage::Ms => Some("mesh"),
+                                HwStage::Cs => Some("compute"),
+                                _ => None,
+                            });
+                            let Some(stage) = stage else { continue };
+                            let compute = pipelines && stage == "compute";
+                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let count = if translated { &done } else { &refused };
+                            let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                            match pipeline {
+                                Some(true) => made.fetch_add(1, Ordering::Relaxed),
+                                Some(false) => unmade.fetch_add(1, Ordering::Relaxed),
+                                None => 0,
+                            };
+                            if n.is_multiple_of(2000) {
+                                println!("{:6.0} s  {n} shaders", started.elapsed().as_secs_f64());
+                            }
+                        }
+                    });
+                }
+            });
+        }
     }
+    victory_hle::modules::d3d12x::save_pipeline_cache();
+    println!(
+        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
+        done.into_inner(),
+        refused.into_inner(),
+        made.into_inner(),
+        unmade.into_inner(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn translate(
@@ -350,57 +389,99 @@ fn translate(
     let Some(bytes) = source.bytes() else {
         return t.fail("corrupt record".into(), example);
     };
+    // The hash a run's log names the shader by (`hash=` in "first bind",
+    // "shader does not translate", "host pipeline refused").
+    let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+    // Diagnostics: `VICTORY_TRANSLATE_ONLY=<hash prefix>,...` translates
+    // those containers alone.
+    static ONLY: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let only = ONLY.get_or_init(|| {
+        std::env::var("VICTORY_TRANSLATE_ONLY")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    let Some(dxil) = container
-        .part(FourCC::DXIL)
-        .or_else(|| container.part(FourCC::ACCC))
-        .map(|p| p.data)
-    else {
+    let Some(dxil) = container.part(FourCC::DXIL).map(|p| p.data) else {
         return t.fail("no DXIL part (SM5 or older)".into(), example);
     };
-    if !lock(seen).insert(blake3::hash(dxil)) {
+    // `~`: the hash of the code alone; containers that differ only around
+    // it are translated once, the others listed as duplicates of it.
+    let code = blake3::hash(dxil);
+    let code8 = code.to_hex()[..8].to_owned();
+    let example = || format!("{} ~{code8}", example());
+    // `VICTORY_DUMP_MATCH=<dir>;<text>|<text>...`: the containers whose
+    // line holds one of the texts (a name, `#hash`), as the title has them.
+    if let Ok(spec) = std::env::var("VICTORY_DUMP_MATCH")
+        && let Some((dir, texts)) = spec.split_once(';')
+    {
+        let line = example();
+        if texts.split('|').any(|text| !text.is_empty() && line.contains(text)) {
+            let name: String = source
+                .label()
+                .chars()
+                .skip_while(|c| *c != ' ')
+                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .take(70)
+                .collect();
+            let _ = std::fs::create_dir_all(dir);
+            let _ = std::fs::write(std::path::Path::new(dir).join(format!("{name}.{hash}.cdxil")), &bytes[..]);
+        }
+    }
+    if !lock(seen).insert(code) {
         t.duplicates += 1;
+        if t.list {
+            t.lines.push(format!("{}  duplicate", example()));
+        }
         return;
     }
-    let programs = match victory_shader::container_programs(&container) {
+    let programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
-    let failures = |t: &Tally| t.failed.values().map(|f| f.0).sum::<usize>();
-    let before = failures(t);
+    // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
+    // has them (`.cdxil`), to work on a translator gap offline
+    let dump = std::env::var_os("VICTORY_FAIL_DUMP");
+    let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
+    translate_programs(&container, programs, &example, t, checks);
+    if let (Some(dir), Some(before)) = (dump, before) {
+        for (reason, (n, _)) in &t.failed {
+            let was = before.get(reason).copied().unwrap_or(0);
+            if *n > was && was < 3 {
+                let stem: String = reason.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).take(60).collect();
+                let _ = std::fs::create_dir_all(&dir);
+                let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{stem}_{was}.cdxil")), &bytes[..]);
+            }
+        }
+    }
+}
+
+fn translate_programs(container: &Container, programs: Vec<NativeProgram>, example: &dyn Fn() -> String, t: &mut Tally, checks: &mut Checks) {
     for p in programs {
         t.programs += 1;
-        match ir::build(&p.patched_code(), p.wave64, p.vgprs) {
-            Ok(mut program) => {
-                if std::env::var_os("VICTORY_DISASM").is_some() {
-                    for (b, block) in program.blocks.iter().enumerate() {
-                        for i in &block.insts {
-                            println!("  {:#x} b{b} {} {:?}", i.machine.offset, i.name(), i.fields);
-                        }
-                    }
-                }
-                victory_shader::unspill::unspill(&mut program, &p.layout, p.stage);
-                victory_shader::sgpr_spill::forward(&mut program);
+        match victory_shader::spill::build(&p) {
+            Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
-                // As `emit::translate_for`: by address where nothing else does.
-                let traces = resource::traces_rays(&program) && p.stage == HwStage::Cs;
-                let mut by_address = traces;
-                let mut tracked = resource::track_with(&program, &p.layout, p.stage, traces);
-                if tracked.is_err() && p.stage == HwStage::Cs {
-                    by_address = !traces;
-                    tracked = resource::track_with(&program, &p.layout, p.stage, by_address);
-                }
-                let res = match tracked {
+                // Per-lane descriptors are traced on the per-lane form; its
+                // failure is listed after the resources' and I/O's.
+                let structured = structure::structure(&program);
+                let lanes = structured.as_ref().ok();
+                let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
                         tally_resources(&p, &r, t);
                         Some(r)
                     }
                     Err(ShaderError::Unsupported { offset, what }) => {
-                        disassemble(&program, offset);
                         t.fail(format!("resources: {what}"), || {
                             format!("{} {:?} at {offset:#x}", example(), p.stage)
                         });
@@ -430,7 +511,7 @@ fn translate(
                         Err(e) => t.fail(e.to_string(), || format!("{} {:?}", example(), p.stage)),
                     }
                 }
-                let structured = match structure::structure(&program) {
+                let structured = match structured {
                     Ok(s) => {
                         tally_structured(&program, &s, t);
                         Some(s)
@@ -448,28 +529,16 @@ fn translate(
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    let mut made = emit::emit(&container, &p, &program, &s, &i, &r, checks.target);
-                    if matches!(made, Err(ShaderError::Unsupported { .. }))
-                        && p.stage == HwStage::Cs
-                        && let Ok(r) =
-                            resource::track_with(&program, &p.layout, p.stage, !by_address)
-                    {
-                        let other = emit::emit(&container, &p, &program, &s, &i, &r, checks.target);
-                        if other.is_ok() || !by_address {
-                            made = other;
-                        }
-                    }
-                    match made {
+                    match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }
-                        Err(ShaderError::Unsupported { offset, what }) => {
-                            disassemble(&program, offset);
-                            t.fail(format!("emit: {what}"), || {
+                        Err(ShaderError::Unsupported { offset, what }) => t
+                            .fail(format!("emit: {what}"), || {
                                 format!("{} at {offset:#x}", label())
-                            })
-                        }
+                            }),
                         Err(e) => t.fail(format!("emit: {e}"), label),
                     }
                 }
@@ -483,18 +552,51 @@ fn translate(
             }
         }
     }
-    // `VICTORY_DUMP_REFUSED`: what fails, each in a file of that folder.
-    if failures(t) > before
-        && let Ok(dir) = std::env::var("VICTORY_DUMP_REFUSED")
-    {
-        let label = source.label();
-        let name: String = label
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-            .collect();
-        let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
-        let _ = std::fs::write(format!("{dir}/{hash}-{name}.dxbc"), &bytes);
+}
+
+/// `VICTORY_SHADER_CENSUS=<file>`: one line per emitted program, appended:
+/// its label, the console program's instructions by encoding class (a
+/// static count of the whole program, not of one thread's path), and the
+/// host module's instructions by kind (`emit::census::KINDS`).
+fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &emit::HostShader) {
+    use std::io::Write;
+    use victory_shader::gfx10::Fields;
+    static OUT: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    let Some(out) = OUT.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_SHADER_CENSUS")?;
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+        Some(Mutex::new(file))
+    }) else {
+        return;
+    };
+    let Some(census) = emit::census::take(&shader.dxil) else {
+        return;
+    };
+    // total, vector, scalar, descriptor loads, buffer and memory, image, LDS, control, other
+    let mut console = [0u32; 9];
+    for inst in p.blocks.iter().flat_map(|b| &b.insts) {
+        console[0] += 1;
+        let k = match &inst.fields {
+            Fields::Valu(_) => 1,
+            Fields::Sop { .. } => 2,
+            Fields::Smem { .. } => 3,
+            Fields::Buffer { .. } | Fields::Flat { .. } => 4,
+            Fields::Image { .. } => 5,
+            Fields::Ds { .. } => 6,
+            Fields::Sopp { .. } => 7,
+            _ => 8,
+        };
+        console[k] += 1;
     }
+    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    for (name, n) in emit::census::KINDS.iter().zip(census.counts) {
+        line.push_str(&format!("\t{name}={n}"));
+    }
+    line.push('\n');
+    let _ = lock(out).write_all(line.as_bytes());
 }
 
 /// Validates an emitted shader if asked to.
@@ -644,18 +746,14 @@ fn tally_resources(p: &NativeProgram, r: &resource::Resources, t: &mut Tally) {
                 t.dynamic += usize::from(address.dynamic.is_some());
                 Some(address)
             }
-            resource::Source::Address => None,
             resource::Source::Constant(_) => {
                 t.constant += 1;
                 None
             }
-            // The previous loop pass's value or an unwritten register:
-            // no source of their own.
-            resource::Source::Carried { .. } | resource::Source::Unset => None,
             resource::Source::Phi { .. }
             | resource::Source::Select { .. }
             | resource::Source::Lanes { .. }
-            | resource::Source::Paths { .. } => {
+            | resource::Source::LanePhi { .. } => {
                 unreachable!("leaves are no phis, selects or per-lane choices")
             }
         };

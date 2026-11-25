@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory"
 description = "Command-line front end: inspect, census, convert, run."

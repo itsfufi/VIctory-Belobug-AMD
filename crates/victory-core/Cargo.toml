@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-core"
 description = "Shared plumbing: configuration, paths, the asset-policy guard, logging."

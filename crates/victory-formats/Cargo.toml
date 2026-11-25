@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-formats"
 description = "Platform-level data formats: texture layouts, compressed textures, audio codecs."

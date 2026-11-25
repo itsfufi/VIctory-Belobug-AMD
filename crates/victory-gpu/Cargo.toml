@@ -1,3 +1,4 @@
+cargo-features = ["edition2024"]
 [package]
 name = "victory-gpu"
 description = "D3D12.X command streams and GPU memory, translated onto host D3D12."
